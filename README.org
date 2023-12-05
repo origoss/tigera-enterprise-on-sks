@@ -117,8 +117,8 @@ kubectl create -f https://downloads.tigera.io/ee/v3.17.2/manifests/tigera-promet
 
 ** Install the pull secrets
 
-Calico Enterprise users need to authenticated at the Calico registry
-to download the container images.
+Calico Enterprise users need to be authenticated at the Calico
+registry to download the container images.
 
 *** Calico pull secrets
 
