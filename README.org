@@ -1,0 +1,299 @@
+#+options: ':nil *:t -:t ::t <:t H:3 \n:nil ^:nil arch:headline
+#+options: author:t broken-links:nil c:nil creator:nil
+#+options: d:(not "LOGBOOK") date:t e:t email:nil f:t inline:t num:t
+#+options: p:nil pri:nil prop:nil stat:t tags:t tasks:t tex:t
+#+options: timestamp:t title:t toc:t todo:t |:t
+#+title: Deploying Calico Enterprise on top of SKS
+#+date: <2023-12-05 Tue>
+#+author: Gergely Szabo
+#+email: gergely.szabo@origoss.com
+#+language: en
+#+select_tags: export
+#+exclude_tags: noexport
+#+creator: Emacs 29.1 (Org mode 9.6.12)
+#+cite_export:
+
+* SKS Cluster Deployment
+** Deploy the demo cluster
+
+#+begin_src bash :results output
+exo compute sks create ceosks-poc \
+    --no-cni                      \
+    --nodepool-size 0             \
+    --zone at-vie-1
+#+end_src
+
+[[file:deploy-sks.gif]]
+
+** Download kubeconfig (exo tool)
+
+#+begin_src bash :results output
+rm -f "$KUBECONFIG"
+exo compute sks kubeconfig ceosks-poc admin \
+    --zone at-vie-1                         \
+    -g system:masters                       \
+    -t $((86400 * 7)) > "$KUBECONFIG"
+chmod 0600 "$KUBECONFIG"
+#+end_src
+
+[[file:download-kubeconfig.gif]]
+
+** Install Longhorn
+
+#+begin_src bash :results output
+helm install my-longhorn longhorn \
+     --version 1.5.1              \
+     --repo https://charts.longhorn.io
+#+end_src
+
+[[file:install-longhorn.gif]]
+
+*** Update the StorageClass name
+
+Calico Enterprise wants to use the StorageClass
+=tigera-elasticsearch=.
+
+The file =storageclass-config.yaml= has the content:
+
+#+name:storageclass-config.yaml
+#+begin_src yaml :tangle storageclass-config.yaml
+apiVersion: v1
+data:
+  storageclass.yaml: |
+    kind: StorageClass
+    apiVersion: storage.k8s.io/v1
+    metadata:
+      name: tigera-elasticsearch
+      annotations:
+        storageclass.kubernetes.io/is-default-class: "true"
+    provisioner: driver.longhorn.io
+    allowVolumeExpansion: true
+    reclaimPolicy: "Delete"
+    volumeBindingMode: Immediate
+    parameters:
+      numberOfReplicas: "3"
+      staleReplicaTimeout: "30"
+      fromBackup: ""
+      fsType: "ext4"
+      dataLocality: "disabled"
+kind: ConfigMap
+metadata:
+  annotations:
+    meta.helm.sh/release-name: my-longhorn
+    meta.helm.sh/release-namespace: default
+  labels:
+    app.kubernetes.io/instance: my-longhorn
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: longhorn
+    app.kubernetes.io/version: v1.5.1
+    helm.sh/chart: longhorn-1.5.1
+  name: longhorn-storageclass
+  namespace: default
+#+end_src
+
+#+begin_src bash :results output
+kubectl apply -f storageclass-config.yaml \
+              --server-side --force-conflicts
+#+end_src
+
+[[file:update-storageclass.gif]]
+
+* Deploying Calico Enterprise
+** Deploy the Calico operator
+
+#+begin_src bash :results output
+kubectl create -f https://downloads.tigera.io/ee/v3.17.2/manifests/tigera-operator.yaml
+#+end_src
+
+[[file:deploy-calico-operator.gif]]
+
+** Deploy the Prometheus Operator
+
+#+begin_src bash :results output
+kubectl create -f https://downloads.tigera.io/ee/v3.17.2/manifests/tigera-prometheus-operator.yaml
+#+end_src
+
+** Install the pull secrets
+
+Calico Enterprise users need to authenticated at the Calico registry
+to download the container images.
+
+*** Calico pull secrets
+
+#+begin_src bash :results output
+kubectl create secret generic tigera-pull-secret \
+        --type=kubernetes.io/dockerconfigjson    \
+	-n tigera-operator                       \
+	--from-file=.dockerconfigjson=tigera-partners-origoss-auth.json
+#+end_src
+
+[[file:install-calico-pull-secrets.gif]]
+
+*** Prometheus pull secrets
+
+#+begin_src bash :results output
+kubectl create secret generic tigera-pull-secret \
+        --type=kubernetes.io/dockerconfigjson    \
+	-n tigera-prometheus                     \
+        --from-file=.dockerconfigjson=tigera-partners-origoss-auth.json
+
+kubectl patch deployment -n tigera-prometheus calico-prometheus-operator \
+        -p '{"spec":{"template":{"spec":{"imagePullSecrets":[{"name": "tigera-pull-secret"}]}}}}'
+#+end_src
+
+[[file:install-prometheus-pull-secrets.gif]]
+
+** Install Calico custom resources
+
+#+begin_src bash :results output
+kubectl create -f https://downloads.tigera.io/ee/v3.17.2/manifests/custom-resources.yaml
+#+end_src
+
+[[file:install-calico-custom-resources.gif]]
+
+** Create SecurityGroup
+
+This security group opens the ports required by Calico Enterprise.
+
+#+begin_src bash :results output
+exo compute security-group create ceosks-poc
+
+exo compute security-group rule add ceosks-poc \
+                --security-group ceosks-poc    \
+		--protocol tcp                 \
+		--port 179
+exo compute security-group rule add ceosks-poc \
+                --security-group ceosks-poc    \
+		--protocol udp                 \
+		--port 4789
+exo compute security-group rule add ceosks-poc \
+                --security-group ceosks-poc    \
+		--protocol tcp                 \
+		--port 5473
+exo compute security-group rule add ceosks-poc \
+                --security-group ceosks-poc    \
+		--protocol tcp                 \
+		--port 10250
+exo compute security-group rule add ceosks-poc \
+                --network 0.0.0.0              \
+		--protocol tcp                 \
+		--port 30000-32767
+exo compute security-group rule add ceosks-poc \
+                --network 0.0.0.0              \
+		--protocol udp                 \
+		--port 30000-32767
+exo compute security-group rule add ceosks-poc \
+                --security-group ceosks-poc    \
+		--protocol udp                 \
+		--port 51820-51821
+#+end_src
+
+[[file:create-securitygroup.gif]]
+
+** Create nodepool
+
+#+begin_src bash :results output
+exo compute sks nodepool add \
+    --zone at-vie-1 ceosks-poc ceosks-poc-worker \
+    --size=2 \
+    --instance-type c6f99499-7f59-4138-9427-a09db13af2bc \
+    --security-group ceosks-poc
+#+end_src
+
+[[file:create-nodepool.gif]]
+
+** Deploy the License
+
+This is the Calico Enterprise license.
+
+#+begin_src bash :results output
+kubectl create -f license.yml
+#+end_src
+
+[[file:deploy-license.gif]]
+
+** Calico Operator Workaround
+
+The Calico NetworkPolicies generated by the Calico Operator preventing
+the components from reaching the SKS Kubernetes API server.
+
+*** The SKS Kubernetes API server
+
+#+begin_src bash :results output
+kubectl describe endpoints/kubernetes -n default
+#+end_src
+
+#+RESULTS:
+#+begin_example
+Name:         kubernetes
+Namespace:    default
+Labels:       endpointslice.kubernetes.io/skip-mirror=true
+Annotations:  <none>
+Subsets:
+  Addresses:          194.182.185.29
+  NotReadyAddresses:  <none>
+  Ports:
+    Name   Port   Protocol
+    ----   ----   --------
+    https  30876  TCP
+
+Events:  <none>
+#+end_example
+
+[[file:sks-apiserver.gif]]
+
+The API server can be reached at =https://194.182.185.29:30876=. This
+endpoint is not allowed by the default Calico network policies.
+
+*** Bypass network policy
+
+#+begin_src yaml :tangle bypass-networkpolicy.yaml
+apiVersion: projectcalico.org/v3
+kind: NetworkPolicy
+metadata:
+  name: allow-tigera.allow-sks-apiserver
+spec:
+  order: 0
+  tier: allow-tigera
+  types:
+    - Egress
+  egress:
+    - action: Allow
+      protocol: TCP
+      destination:
+        ports:
+          - 30876
+#+end_src
+
+#+begin_src bash :results output
+kubectl apply -f bypass-networkpolicy.yaml -n calico-system
+kubectl apply -f bypass-networkpolicy.yaml -n tigera-eck-operator
+#+end_src
+
+[[file:deploy-bypass-policies.gif]]
+
+* Accessissing the system
+** Create a user
+
+#+begin_src bash :results output
+kubectl create sa tigera-admin -n default
+kubectl create clusterrolebinding tigera-admin \
+        --clusterrole tigera-network-admin     \
+        --serviceaccount default:tigera-admin
+#+end_src
+
+[[file:create-admin-user.gif]]
+
+** Create an authentication token
+
+#+begin_src bash :results output
+kubectl create token tigera-admin -n default
+#+end_src
+
+** Port forward to Tigera Manager
+
+#+begin_src bash :results output :eval never
+kubectl port-forward -n tigera-manager service/tigera-manager 9443:9443
+#+end_src
+
+Access the Tigera Manager dashboard at [[https://localhost:9443]]
