@@ -292,6 +292,8 @@ kubectl create clusterrolebinding tigera-admin \
 kubectl create token tigera-admin -n default
 #+end_src
 
+[[file:create-auth-token.gif]]
+
 ** Port forward to Tigera Manager
 
 #+begin_src bash :results output :eval never
@@ -299,3 +301,5 @@ kubectl port-forward -n tigera-manager service/tigera-manager 9443:9443
 #+end_src
 
 Access the Tigera Manager dashboard at [[https://localhost:9443]]
+
+[[file:port-forward.gif]]
